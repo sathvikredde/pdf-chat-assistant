@@ -5,16 +5,17 @@ import json
 import sqlite3
 import os
 import io
+import base64
 import time
 from datetime import datetime
 
-# ── Setup: API key from Streamlit secrets (cloud) or env var (local) ──────────
+# ── Setup ─────────────────────────────────────────────────────────────────────
 api_key = st.secrets.get("OPENAI_API_KEY", os.environ.get("OPENAI_API_KEY", ""))
 client  = OpenAI(api_key=api_key)
 
 JSON_FILE = "transactions.json"
 DB_FILE   = "transactions.db"
-TIMEOUT   = 10 * 60   # 10 minutes
+TIMEOUT   = 10 * 60  # 10 minutes
 
 # ── DB ────────────────────────────────────────────────────────────────────────
 def init_db():
@@ -59,38 +60,74 @@ def save_to_json_and_db(transactions: dict):
     conn.commit()
     conn.close()
 
-# ── PDF reader (auto OCR fallback for scanned PDFs) ───────────────────────────
+# ── PDF → text (text layer first, GPT-4o Vision fallback for scanned) ─────────
+def pdf_to_page_images_b64(data: bytes) -> list[str]:
+    """Convert each PDF page to a base64 PNG string."""
+    doc = fitz.open(stream=data, filetype="pdf")
+    images = []
+    for page in doc:
+        pix = page.get_pixmap(dpi=150)
+        images.append(base64.b64encode(pix.tobytes("png")).decode())
+    return images
+
 def read_pdf_bytes(data: bytes) -> str:
+    """Extract text. If the PDF is scanned, use GPT-4o Vision to read it."""
     doc  = fitz.open(stream=data, filetype="pdf")
     text = "".join(page.get_text() for page in doc).strip()
 
-    if not text:
-        # Scanned PDF — use Tesseract OCR page by page
-        import pytesseract
-        from PIL import Image
-        ocr_parts = []
-        for page in doc:
-            pix = page.get_pixmap(dpi=200)
-            img = Image.open(io.BytesIO(pix.tobytes("png")))
-            ocr_parts.append(pytesseract.image_to_string(img))
-        text = "\n".join(ocr_parts).strip()
+    if text:
+        return text  # normal text-based PDF — done
 
-    return text
+    # Scanned PDF: send each page image to GPT-4o and ask it to transcribe
+    st.info("📷 Scanned PDF detected — using AI Vision to read it (this may take a moment)…")
+    page_images = pdf_to_page_images_b64(data)
+
+    all_text = []
+    for i, img_b64 in enumerate(page_images):
+        resp = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            f"This is page {i+1} of a financial document. "
+                            "Please transcribe ALL text you see exactly as it appears, "
+                            "preserving dates, amounts, names, and transaction details."
+                        )
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{img_b64}"}
+                    }
+                ]
+            }],
+            max_tokens=2000,
+        )
+        all_text.append(resp.choices[0].message.content)
+
+    return "\n\n".join(all_text).strip()
 
 # ── Transaction extractor ─────────────────────────────────────────────────────
 EXTRACT_PROMPT = """
-From the conversation below, extract every financial transaction mentioned.
-Return ONLY a raw JSON object (no markdown, no backticks, no explanation):
+From the conversation below, extract every financial transaction that was discussed.
+Return ONLY a raw JSON object — no markdown, no backticks, no explanation.
 
+Use this exact format:
 {{
-  "<uuid4>": {{
+  "<generate-a-uuid4-here>": {{
     "transaction_date": "YYYY-MM-DD",
     "type": "credit or debit",
-    "parties_involved": "sent to whom / received from whom"
+    "parties_involved": "received from X / sent to Y"
   }}
 }}
 
-If no transactions were discussed return: {{}}
+Rules:
+- Generate a real UUID4 string for each key (e.g. "a1b2c3d4-e5f6-7890-abcd-ef1234567890")
+- Use real dates from the conversation, not "YYYY-MM-DD"
+- Use real names/parties from the conversation, not "unknown"
+- If no transactions were discussed return exactly: {{}}
 
 Conversation:
 {conversation}
@@ -99,13 +136,18 @@ Conversation:
 def extract_transactions(history: list) -> dict:
     convo = "\n".join(f"{m['role'].upper()}: {m['content']}" for m in history)
     resp  = client.chat.completions.create(
-        model="gpt-4o-mini",
+        model="gpt-4o",
         messages=[{"role": "user", "content": EXTRACT_PROMPT.format(conversation=convo)}],
-        max_tokens=1500,
+        max_tokens=2000,
     )
     raw = resp.choices[0].message.content.strip()
+    # strip markdown fences if model adds them anyway
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
     try:
-        return json.loads(raw)
+        return json.loads(raw.strip())
     except Exception:
         return {}
 
@@ -113,9 +155,10 @@ def extract_transactions(history: list) -> dict:
 def build_system_prompt(pdf_text: str) -> str:
     return (
         "You are a helpful financial document assistant. "
-        "Answer all questions based on the PDF content below. "
+        "Answer all questions based ONLY on the PDF content below. "
+        "When mentioning transactions always include the exact date, amount, type (credit/debit), and parties involved. "
         "Be concise, accurate, and friendly.\n\n"
-        f"--- PDF START ---\n{pdf_text[:12000]}\n--- PDF END ---"
+        f"--- PDF CONTENT ---\n{pdf_text[:15000]}\n--- END ---"
     )
 
 # ── Session state init ────────────────────────────────────────────────────────
@@ -133,7 +176,7 @@ for k, v in {
 
 # ── Page ──────────────────────────────────────────────────────────────────────
 st.title("📄 PDF Chat Assistant")
-st.caption("Upload a PDF, ask questions, say **bye** to save and exit.")
+st.caption("Upload a PDF, ask questions about it, say **bye** to save and exit.")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 1 — upload
@@ -154,7 +197,7 @@ if not st.session_state.pdf_text and not st.session_state.done:
                 try:
                     text = read_pdf_bytes(st.session_state.pdf_bytes)
                     if not text:
-                        st.error("Could not extract text from this PDF. The file may be corrupted.")
+                        st.error("Could not extract any text from this PDF.")
                     else:
                         st.session_state.pdf_text    = text
                         st.session_state.pdf_bytes   = None
@@ -180,7 +223,7 @@ if not st.session_state.done:
         with st.chat_message("user" if msg["role"] == "user" else "assistant"):
             st.markdown(msg["content"])
 
-    user_input = st.chat_input("Ask something… or type 'bye' to finish")
+    user_input = st.chat_input("Ask something about the PDF… or type 'bye' to finish")
 
     if user_input:
         st.session_state.last_active = time.time()
@@ -194,11 +237,11 @@ if not st.session_state.done:
         with st.chat_message("assistant"):
             with st.spinner("Thinking…"):
                 resp = client.chat.completions.create(
-                    model="gpt-4o-mini",
+                    model="gpt-4o",
                     messages=[
                         {"role": "system", "content": build_system_prompt(st.session_state.pdf_text)}
                     ] + st.session_state.history,
-                    max_tokens=800,
+                    max_tokens=1000,
                 )
             reply = resp.choices[0].message.content
             st.markdown(reply)
@@ -229,7 +272,6 @@ if st.session_state.done:
                 st.write(f"**Parties:** {data.get('parties_involved', '—')}")
                 st.caption(f"UUID: {uid}")
 
-        # Download button — user gets the JSON file directly
         st.download_button(
             label="⬇️ Download transactions.json",
             data=json.dumps(saved, indent=2),
